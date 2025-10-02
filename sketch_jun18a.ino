@@ -1,392 +1,487 @@
 /*
-  ESP32 Firmware for Smart Distribution Transformer Prototype
-
-  This code implements the control logic for the Smart Distribution Transformer
-  prototype, including:
-  1. Real-time monitoring of 3-phase voltage, current, and transformer oil temperature.
-  2. Dynamic load management (switching Transformer 2 based on load current).
-  3. 3-phase overcurrent protection (individual and global load disconnection).
-  4. Smart cooling system activation based on oil temperature.
-  5. Wireless data transmission to the Blynk IoT platform for remote monitoring.
-
-  Hardware used:
-  - ESP32 Microcontroller (e.g., NodeMCU ESP32, ESP32 DevKitC)
-  - Freenove ESP32 Breakout Board (for easy pin access and power)
-  - ZMPT101B Voltage Sensor Modules (3 units for 3 phases)
-  - ACS712 Current Sensor Modules (3 units for 3 phases)
-  - DS18B20 Temperature Sensor (1 unit for mineral oil temperature)
-  - DCR-M70 DC 5V 8-Channel Solid State Relay Module
-    - Used for PHASE_RELAY_PINS (dynamic load management/individual phase control)
-    - Used for GLOBAL_RELAY_PINS (global load disconnection)
-    - Used for TEMP_RELAY_PIN (cooling system activation)
-  - Standard gaming PC radiator with fan
-  - domoi Ultra-Quiet SC-300T Water Pump Set (used here for mineral oil circulation)
-
-  NOTE: This prototype design immerses only the transformers in mineral oil.
-  All sensitive electronic components (ESP32, sensors, relays) are housed in a
-  dedicated DRY COMPARTMENT located above the oil level within the main casing.
-  This ensures component compatibility, reduces EMI, and simplifies maintenance.
-  Careful consideration of the domoi pump's compatibility with mineral oil
-  and potential long-term effects on the radiator is crucial during physical
-  implementation and testing.
+  Smart Transformer – PF-enabled build (ESP32 + ADS1115 + ZMPT + ACS712)
+  - Per-phase Vrms, Irms, Real Power (W), Apparent Power (VA), PF
+  - Total P, S, PF
+  - Auto phase alignment via cross-correlation (per phase)
+  - ThingsBoard telemetry integrated
+  - Relays kept OFF until TB is connected (safety)
 */
 
-// ===================== Blynk & WiFi Configuration =====================
-// These credentials link your ESP32 to your specific Blynk project.
-// Replace with your actual Blynk Template ID, Template Name, and Auth Token.
-#define BLYNK_TEMPLATE_ID "TMPL6S6gTBKzZ"
-#define BLYNK_TEMPLATE_NAME "Smart Power Transformer" // Corrected: Name from template
-#define BLYNK_AUTH_TOKEN "L8AVcMna8R-3uZCP5eTgfahX-A6xjxx1"
+#include <Adafruit_ADS1X15.h>
+#include <ZMPT101B.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <WiFi.h>
+#include <Arduino_MQTT_Client.h>
+#include <ThingsBoard.h>
+#include <ArduinoJson.h>
+#include <math.h>
+#include <Wire.h>
 
-// Include necessary libraries for WiFi, Blynk, OneWire, DallasTemperature,
-// ACS712, and ZMPT101B sensors.
-#include <WiFi.h>              // Standard WiFi library for ESP32
-#include <BlynkSimpleEsp32.h>  // Blynk library for ESP32 connectivity
-#include <OneWire.h>           // Library for 1-Wire communication protocol (for DS18B20)
-#include <DallasTemperature.h> // Library for DS18B20 temperature sensor
-#include <ACS712.h>            // Custom library for ACS712 current sensor (might need to be installed)
-#include <ZMPT101B.h>          // Custom library for ZMPT101B voltage sensor (might need to be installed)
+// ------------------------ WiFi & ThingsBoard ------------------------
+constexpr char WIFI_SSID[] = "omega";
+constexpr char WIFI_PASSWORD[] = "09000900";
+constexpr char TOKEN[] = "kaz30jqlzu12pnx82hab";
+constexpr char THINGSBOARD_SERVER[] = "192.168.4.23";
+constexpr uint16_t THINGSBOARD_PORT = 1883U;
 
-// WiFi Credentials: Your Wi-Fi network's SSID and password.
-// Replace with your actual Wi-Fi network details.
-char auth[] = BLYNK_AUTH_TOKEN;    // Use the defined Auth Token for consistency
-char ssid[] = "Galaxy S10ea74f";   // Your Wi-Fi Network Name
-char pass[] = "addv5860";          // Your Wi-Fi Network Password
+WiFiClient wifiClient;
+Arduino_MQTT_Client mqttClient(wifiClient);
+ThingsBoard tb(mqttClient);
 
-// Blynk Virtual Pins: Mappings for sending sensor data to the Blynk dashboard.
-// These correspond to the Virtual Pins configured in your Blynk app.
-#define BLYNK_V_TEMP   V0 // Virtual Pin for Temperature data
-#define BLYNK_V_VOLT1  V1 // Virtual Pin for Phase 1 Voltage
-#define BLYNK_V_VOLT2  V2 // Virtual Pin for Phase 2 Voltage
-#define BLYNK_V_VOLT3  V3 // Virtual Pin for Phase 3 Voltage
-#define BLYNK_V_CURR1  V4 // Virtual Pin for Phase 1 Current
-#define BLYNK_V_CURR2  V5 // Virtual Pin for Phase 2 Current
-#define BLYNK_V_CURR3  V6 // Virtual Pin for Phase 3 Current
+// ------------------------ Voltage Sensors (ZMPT on ADC) -----------
+const uint8_t SENSOR_PIN0 = 32; // L1
+const uint8_t SENSOR_PIN1 = 33; // L2
+const uint8_t SENSOR_PIN2 = 34; // L3
 
-// ===================== Hardware Configuration & Pin Assignments =====================
+// Optional: keep ZMPT objects for your existing calibration flow (not used for PF)
+#define VOLT_SENSITIVITY 440.75f
+#define NOISE_THRESHOLD 5.0f
+ZMPT101B voltageSensor0(SENSOR_PIN0);
+ZMPT101B voltageSensor1(SENSOR_PIN1);
+ZMPT101B voltageSensor2(SENSOR_PIN2);
 
-// DS18B20 Temperature Sensor:
-// Pin connected to the 1-Wire data line of the DS18B20 sensor.
+// ADC scaling for ESP32 raw -> volts, then to actual secondary volts (per-phase scale)
+constexpr float ADC_TO_VOLTS = 3.3f / 4095.0f;
+// Set these after first test so Vrms ≈ your real secondary (e.g., 24–26V)
+float VOLT_SCALE1 = 480.0f; // for L1 (update after first run)
+float VOLT_SCALE2 = 480.0f; // for L2
+float VOLT_SCALE3 = 480.0f; // for L3
+
+// ------------------------ Current Sensors (ADS1115 + ACS712) ------
+Adafruit_ADS1115 ads;
+const int NUM_CHANNELS = 3;
+const int CURR_CH[NUM_CHANNELS] = {0, 1, 2}; // ADS A0,A1,A2
+
+// Sensitivity V/A for ACS712: 5A=0.185, 20A=0.100, 30A=0.066
+const float CURRENT_SENSITIVITY[NUM_CHANNELS] = {0.07187f, 0.07187f, 0.07187f};
+
+// Offsets captured at startup (raw units)
+float voltOffsetADC[NUM_CHANNELS] = {0, 0, 0};   // ESP32 ADC raw (0..4095)
+int16_t currOffsetRAW[NUM_CHANNELS] = {0, 0, 0}; // ADS1115 raw
+
+// ------------------------ Temperature & Pot ------------------------
 const int ONE_WIRE_BUS = 4;
-OneWire oneWire(ONE_WIRE_BUS);          // Setup a 1-Wire instance to communicate with any 1-Wire devices
-DallasTemperature sensors(&oneWire);    // Pass our 1-Wire reference to Dallas Temperature sensor library
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature tempSensor(&oneWire);
 
-// Temperature Smoothing:
-// Number of readings to average for temperature smoothing.
-// Reduced from 5 to 3 for faster response to temperature changes.
-const int SMOOTHING_READINGS = 3;
-float tempReadings[SMOOTHING_READINGS]; // Array to store recent temperature readings for smoothing
-int currentIndex = 0;                   // Index for the current reading in the smoothing array (circular buffer)
-float smoothedTemp = 0;                 // Variable to store the calculated smoothed temperature
+const int TEMP_SMOOTHING_READINGS = 10;
+float tempReadings[TEMP_SMOOTHING_READINGS] = {};
+int tempIndex = 0;
+float smoothedTemp = NAN;
 
-// Protection Limits:
-// Pin connected to the relay controlling the cooling system.
-#define TEMP_RELAY_PIN        21
-// Temperature threshold in Celsius. If smoothedTemp exceeds this, cooling system activates.
-#define TEMP_LIMIT            50.0
-// Current noise threshold in mA. Readings below this are considered noise (0 mA).
-#define CURR_NOISE_THRESHOLD  60 // mA (increased from 50mA to filter more noise)
-// Voltage noise threshold in Volts. Readings below this are considered noise (0 V).
-#define VOLT_NOISE_THRESHOLD  6.0f // V (increased from 5V to filter more noise)
+const int potPin = 36; // ADC
+const int POT_SMOOTHING = 10;
+int potValues[POT_SMOOTHING] = {};
+int potIndex = 0;
+float smoothedPotPercent = 0.0f;
 
-// ZMPT101B Voltage Sensors:
-// Sensitivity factor for ZMPT101B. This value is crucial for accurate voltage conversion.
-// It depends on the voltage divider resistors on the ZMPT101B module and the ESP32's ADC.
-#define SENSITIVITY 440.75f
-// Analog pins connected to the ZMPT101B modules for 3 phases.
-const uint8_t PHASE_VOLT_PINS[3] = {32, 33, 34};
-// Array of ZMPT101B objects, one for each phase.
-ZMPT101B voltSensors[3] = {
-  ZMPT101B(PHASE_VOLT_PINS[0]),
-  ZMPT101B(PHASE_VOLT_PINS[1]),
-  ZMPT101B(PHASE_VOLT_PINS[2])
+// ------------------------ Relays -----------------------------------
+const int relayPins[8] = {13, 14, 16, 17, 25, 26, 27, 19};
+unsigned long relayOffTime[8] = {0};
+
+// ------------------------ States/Status Strings --------------------
+bool lastRelay456State = true;
+String loadStatus = "Connected";
+String faultStatus = "No";
+String T1_status = "OFF";
+String T2_status = "OFF";
+String charging_status = "OFF";
+String pump_state = "OFF";
+
+// ------------------------ PF Sampling / Math -----------------------
+const int NUM_SAMPLES = 200;        // waveform samples per cycle
+const int SAMPLE_DELAY_US = 250;    // ~4 kHz overall sampling cadence
+const int MAX_LAG = 12;             // cross-correlation search window (±lag samples)
+
+// ------------------------ NEW: Noise Thresholds --------------------
+const float VOLTAGE_NOISE_THRESHOLD = 10.0f;    // 10V threshold
+const float CURRENT_NOISE_THRESHOLD = 0.065f;   // 65mA threshold
+
+// ------------------------ Timing -----------------------------------
+uint32_t previousDataSend = 0;
+constexpr uint32_t TELEMETRY_SEND_INTERVAL = 2000U;
+
+uint32_t lastSensorRead = 0;
+constexpr uint32_t SENSOR_READ_INTERVAL = 150U;
+
+// ------------------------ Telemetry struct -------------------------
+struct SensorData {
+  float voltages[3];   // Vrms per phase
+  float currents[3];   // Irms per phase (A)
+  float currents_mA[3];
+  float VA[3];         // Apparent per phase
+  float power[3];      // Real per phase
+  float pf[3];         // PF per phase
+  float totalVA;
+  float totalPower;
+  float totalPF;
+  float temperature;
+  float potentiometer;
 };
+SensorData currentData;
 
-// ACS712 Current Sensors:
-// Analog pins connected to the ACS712 modules for 3 phases.
-const uint8_t PHASE_CURR_PINS[3] = {35, 36, 39};
-// Array of ACS712 objects, one for each phase.
-// Constructor parameters: (pin, VCC_Voltage, ADC_Resolution, mV_per_Amp)
-// - 3.3: ESP32's analog reference voltage
-// - 4095: ESP32's 12-bit ADC resolution (0 to 4095)
-// - 185: mV per Ampere for the 5A version of ACS712 (check your sensor's datasheet!)
-ACS712 currSensors[3] = {
-  ACS712(PHASE_CURR_PINS[0], 3.3, 4095, 185),
-  ACS712(PHASE_CURR_PINS[1], 3.3, 4095, 185),
-  ACS712(PHASE_CURR_PINS[2], 3.3, 4095, 185)
-};
-
-// Relay Pin Assignments:
-// Pins connected to the relays for individual phase control (e.g., Transformer 2 switching).
-const uint8_t PHASE_RELAY_PINS[3] = {13, 14, 16};
-// Pins connected to the relays for global load disconnection (main protection).
-const uint8_t GLOBAL_RELAY_PINS[3] = {17, 18, 19};
-
-// Protection Thresholds (Current):
-// Individual phase current limit in mA. If current on a phase exceeds this, it might be switched.
-// In the current logic, this is used for individual phase relays, which might be Transformer 2 control.
-const int INDIVIDUAL_LIMIT = 1000; // mA (1 Ampere)
-// Global current limit in mA. If current on any phase exceeds this, all global relays open.
-const int GLOBAL_LIMIT = 2000;      // mA (2 Amperes)
-// Cooldown time in milliseconds after a global protection trip before it can be reset.
-const unsigned long COOLDOWN_TIME = 60000; // 60 seconds (1 minute)
-
-// Sensor Calibration Variables:
-// Zero-point offsets for current sensors. Determined during calibration.
-// AnalogRead(0A) should ideally be around 2048 for a 12-bit ADC with Vcc/2 bias.
-int zeroPoints[3] = {2048, 2048, 2048};
-// Scaling factors for current sensors (can be adjusted after initial testing/calibration).
-float scaling[3] = {1.0, 1.0, 1.0};
-
-// Global Protection State Variables:
-// Flag to indicate if global protection is currently active.
-bool globalProtectionActive = false;
-// Timestamp when global protection was activated. Used for cooldown timer.
-unsigned long globalProtectionStart = 0;
-
-// ===================== Function Definitions =====================
-
-/**
- * @brief Reads current and voltage data from all three phases.
- * This function optimizes sensor reading by performing all reads in one go,
- * reducing potential delays from multiple sensor accesses in the main loop.
- *
- * @param currents Array to store RMS current values (in mA) for each phase.
- * @param voltages Array to store RMS voltage values (in V) for each phase.
- */
-void readSensors(float (&currents)[3], float (&voltages)[3]) {
-  for (int i = 0; i < 3; i++) {
-    // Current Sensor (ACS712) Reading and Conversion:
-    // 1. Read raw analog-to-digital converter (ADC) value from the current sensor pin.
-    // 2. Subtract the calibrated `zeroPoint` offset. This compensates for the sensor's
-    //    output voltage when no current flows (bias).
-    int rawCurrent = analogRead(PHASE_CURR_PINS[i]) - zeroPoints[i];
-    
-    // 3. Convert the raw ADC offset value to current in milliamps (mA).
-    //    The formula used here:
-    //    abs(rawCurrent) - takes the absolute value as current can flow in both directions.
-    //    (3.3 / 4095.0) - converts ADC reading (0-4095) to voltage (0-3.3V).
-    //    (1000 / 0.185) - converts voltage to mA, based on 185mV/A sensitivity.
-    //    scaling[i] - applies an optional calibration factor for fine-tuning.
-    currents[i] = abs(rawCurrent) * (3.3 / 4095.0) * (1000 / 0.185) * scaling[i];
-    
-    // Apply noise threshold: if the calculated current is very low, assume it's electrical noise
-    // and set the current value to 0 mA to prevent spurious readings.
-    if (currents[i] < CURR_NOISE_THRESHOLD) currents[i] = 0;
-
-    // Voltage Sensor (ZMPT101B) Reading and Conversion:
-    // `getRmsVoltage()` is a method provided by the ZMPT101B library that
-    // calculates and returns the Root Mean Square (RMS) voltage.
-    voltages[i] = voltSensors[i].getRmsVoltage();
-    // Apply noise threshold: if the calculated voltage is very low, assume it's noise
-    // and set the voltage value to 0 V.
-    if (voltages[i] < VOLT_NOISE_THRESHOLD) voltages[i] = 0;
+// ------------------------ Helpers ----------------------------------
+void InitWiFi() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  Serial.print("Connecting to WiFi "); Serial.println(WIFI_SSID);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  unsigned long startTime = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 12000) {
+    delay(200); Serial.print(".");
+  }
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nConnected to WiFi");
+    Serial.print("IP Address: "); Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nFailed to connect to WiFi");
   }
 }
 
-/**
- * @brief Handles the global overcurrent protection logic for the transformer.
- * This function continuously monitors all three phases. If the current in any
- * phase exceeds the `GLOBAL_LIMIT`, it activates the global relays to disconnect
- * the main load, protecting the transformer and downstream equipment.
- * A cooldown period is implemented before the system can be reset, preventing
- * immediate re-engagement after a fault.
- *
- * @param currents Array of RMS current values (in mA) for each phase.
- */
-void handleGlobalProtection(float currents[3]) {
-  // Iterate through each phase to check for overcurrent.
-  for (int i = 0; i < 3; i++) {
-    // If current in any phase exceeds the `GLOBAL_LIMIT` AND global protection is not already active:
-    if (currents[i] > GLOBAL_LIMIT && !globalProtectionActive) {
-      globalProtectionActive = true;       // Set the flag to indicate global protection is now active.
-      globalProtectionStart = millis();    // Record the current time for the cooldown timer.
-      // Activate all global relays (set to LOW) to disconnect the main load.
-      // (Assuming LOW signal activates the relay and opens the circuit).
-      for (int r = 0; r < 3; r++) digitalWrite(GLOBAL_RELAY_PINS[r], LOW);
-      Serial.println("!!! GLOBAL OVERCURRENT - MAIN LOAD DISCONNECTED !!!"); // Print an alert message to the Serial Monitor.
-      break; // Exit the loop immediately once an overcurrent is detected to prevent redundant actions.
+float readVoltageRMS_ZMPT(ZMPT101B& sensor) {
+  float v = sensor.getRmsVoltage();
+  return (v < NOISE_THRESHOLD) ? 0.0f : v;
+}
+
+void monitorLoadStatus() {
+  bool r456 = (digitalRead(relayPins[3]) == HIGH &&
+               digitalRead(relayPins[4]) == HIGH &&
+               digitalRead(relayPins[5]) == HIGH);
+  loadStatus  = r456 ? "Connected" : "Disconnected";
+  faultStatus = r456 ? "No" : "Yes";
+  lastRelay456State = r456;
+}
+
+// Cross-correlation to find best lag between v[] and i[]
+int bestLag(const float* v, const float* i, int N, int maxLag) {
+  double best = -1e18;
+  int lagBest = 0;
+  for (int lag = -maxLag; lag <= maxLag; lag++) {
+    double corr = 0.0;
+    for (int n = 0; n < N; n++) {
+      int j = n + lag;
+      if (j >= 0 && j < N) corr += (double)v[n] * (double)i[j];
+    }
+    if (corr > best) { best = corr; lagBest = lag; }
+  }
+  return lagBest;
+}
+
+// ------------------------ Setup Sensors / Relays --------------------
+void setupSensors() {
+  Serial.println("Initializing Sensors...");
+
+  // ZMPT sensitivity (library path not used for PF, but keep it set)
+  voltageSensor0.setSensitivity(VOLT_SENSITIVITY);
+  voltageSensor1.setSensitivity(VOLT_SENSITIVITY);
+  voltageSensor2.setSensitivity(VOLT_SENSITIVITY);
+
+  // I2C hi-speed + ADS1115
+  Wire.begin();
+  Wire.setClock(400000);
+  ads.setGain(GAIN_ONE); // ±4.096V
+  if (!ads.begin()) {
+    Serial.println("ADS1115 failed!");
+    while (1) { delay(1000); }
+  }
+
+  // Temperature
+  tempSensor.begin();
+  for (int i = 0; i < TEMP_SMOOTHING_READINGS; i++) tempReadings[i] = NAN;
+
+  // Pot smoothing
+  for (int i = 0; i < POT_SMOOTHING; i++) potValues[i] = 0;
+
+  // Offset calibration (no load)
+  Serial.println("Calibrating offsets... keep secondary unloaded.");
+  const int CALS = 200;
+  long vSumADC[3] = {0,0,0};
+  long iSumRAW[3] = {0,0,0};
+  for (int n = 0; n < CALS; n++) {
+    vSumADC[0] += analogRead(SENSOR_PIN0);
+    vSumADC[1] += analogRead(SENSOR_PIN1);
+    vSumADC[2] += analogRead(SENSOR_PIN2);
+    iSumRAW[0] += ads.readADC_SingleEnded(CURR_CH[0]);
+    iSumRAW[1] += ads.readADC_SingleEnded(CURR_CH[1]);
+    iSumRAW[2] += ads.readADC_SingleEnded(CURR_CH[2]);
+    delay(5);
+  }
+  for (int k = 0; k < 3; k++) {
+    voltOffsetADC[k] = (float)vSumADC[k] / CALS;
+    currOffsetRAW[k] = (int16_t)(iSumRAW[k] / CALS);
+  }
+  Serial.printf("Offsets: Vadc[%.1f, %.1f, %.1f], Iraw[%d, %d, %d]\n",
+    voltOffsetADC[0], voltOffsetADC[1], voltOffsetADC[2],
+    currOffsetRAW[0], currOffsetRAW[1], currOffsetRAW[2]);
+
+  Serial.println("All sensors initialized.");
+}
+
+void setupRelays() {
+  for (int i = 0; i < 8; i++) {
+    pinMode(relayPins[i], OUTPUT);
+    digitalWrite(relayPins[i], LOW); // OFF at boot
+  }
+  Serial.println("Relays initialized (all OFF).");
+}
+
+// ------------------------ T1/T2 display flags ----------------------
+void calculateT1T2Status() {
+  float max_mA = max(currentData.currents_mA[0],
+                 max(currentData.currents_mA[1], currentData.currents_mA[2]));
+  T1_status = (max_mA >= 90.0f && max_mA <= 2000.0f) ? "ON" : "OFF";
+  T2_status = (max_mA >= 1000.0f && max_mA <= 2000.0f) ? "ON" : "OFF";
+}
+
+// ------------------------ Relay Control ----------------------------
+void controlRelays(bool systemEnabled) {
+  // If not enabled (TB not connected), keep everything OFF for safety
+  if (!systemEnabled) {
+    for (int i = 0; i < 8; i++) digitalWrite(relayPins[i], LOW);
+    charging_status = "OFF";
+    pump_state = "OFF";
+    calculateT1T2Status();
+    monitorLoadStatus();
+    return;
+  }
+
+  unsigned long now = millis();
+
+  // Relays 1-3: ON if any phase >= 1.0 A
+  bool highCurrent = (currentData.currents[0] >= 1.0f ||
+                      currentData.currents[1] >= 1.0f ||
+                      currentData.currents[2] >= 1.0f);
+  for (int i = 0; i < 3; i++) digitalWrite(relayPins[i], highCurrent ? LOW : HIGH);
+
+  // Relays 4-6: Overcurrent >= 2.0 A -> OFF for 60s
+  bool veryHigh = (currentData.currents[0] >= 2.0f ||
+                   currentData.currents[1] >= 2.0f ||
+                   currentData.currents[2] >= 2.0f);
+  if (veryHigh) {
+    relayOffTime[3] = now;
+    for (int i = 3; i < 6; i++) digitalWrite(relayPins[i], LOW);
+  } else if (now - relayOffTime[3] >= 60000UL) {
+    for (int i = 3; i < 6; i++) digitalWrite(relayPins[i], HIGH);
+  }
+
+  // Relay 7: charging window 20–28 V (avg)
+  float vAvg = (currentData.voltages[0] + currentData.voltages[1] + currentData.voltages[2]) / 3.0f;
+  bool chargeOn = (vAvg >= 20.0f && vAvg <= 28.0f);
+  digitalWrite(relayPins[6], chargeOn ? HIGH : LOW);
+  charging_status = chargeOn ? "ON" : "OFF";
+
+  // Relay 8: pump >= 50 C
+  bool pumpOn = (isfinite(currentData.temperature) && currentData.temperature >= 50.0f);
+  digitalWrite(relayPins[7], pumpOn ? LOW : HIGH);
+  pump_state = pumpOn ? "ON" : "OFF";
+
+  calculateT1T2Status();
+  monitorLoadStatus();
+}
+
+// ------------------------ Waveform Read + PF Math ------------------
+void readWaveformPF() {
+  // buffers per phase
+  float vBuf[3][NUM_SAMPLES];
+  float iBuf[3][NUM_SAMPLES];
+
+  // Collect waveform samples
+  for (int n = 0; n < NUM_SAMPLES; n++) {
+    // Voltage samples (ESP32 ADC)
+    int rawV0 = analogRead(SENSOR_PIN0);
+    int rawV1 = analogRead(SENSOR_PIN1);
+    int rawV2 = analogRead(SENSOR_PIN2);
+
+    // Convert to scaled volts per phase (remove offset then scale)
+    vBuf[0][n] = ( (rawV0 - voltOffsetADC[0]) * ADC_TO_VOLTS ) * VOLT_SCALE1;
+    vBuf[1][n] = ( (rawV1 - voltOffsetADC[1]) * ADC_TO_VOLTS ) * VOLT_SCALE2;
+    vBuf[2][n] = ( (rawV2 - voltOffsetADC[2]) * ADC_TO_VOLTS ) * VOLT_SCALE3;
+
+    // Current samples (ADS1115)
+    int16_t rI0 = ads.readADC_SingleEnded(CURR_CH[0]);
+    int16_t rI1 = ads.readADC_SingleEnded(CURR_CH[1]);
+    int16_t rI2 = ads.readADC_SingleEnded(CURR_CH[2]);
+
+    // Convert to volts, remove offset, then to Amps via sensitivity
+    float vI0 = ads.computeVolts( (int32_t)rI0 - (int32_t)currOffsetRAW[0] );
+    float vI1 = ads.computeVolts( (int32_t)rI1 - (int32_t)currOffsetRAW[1] );
+    float vI2 = ads.computeVolts( (int32_t)rI2 - (int32_t)currOffsetRAW[2] );
+
+    iBuf[0][n] = vI0 / CURRENT_SENSITIVITY[0];
+    iBuf[1][n] = vI1 / CURRENT_SENSITIVITY[1];
+    iBuf[2][n] = vI2 / CURRENT_SENSITIVITY[2];
+
+    delayMicroseconds(SAMPLE_DELAY_US);
+  }
+
+  // Per-phase compute with auto lag
+  float Vrms[3] = {0}, Irms[3] = {0}, P[3] = {0}, S[3] = {0}, PF[3] = {0};
+
+  for (int ph = 0; ph < 3; ph++) {
+    // Find best lag to align I to V
+    int lag = bestLag(vBuf[ph], iBuf[ph], NUM_SAMPLES, MAX_LAG);
+
+    double sumV2 = 0.0, sumI2 = 0.0, sumVI = 0.0;
+    int count = 0;
+
+    for (int n = 0; n < NUM_SAMPLES; n++) {
+      int j = n + lag;
+      if (j < 0 || j >= NUM_SAMPLES) continue;
+      float v = vBuf[ph][n];
+      float i = iBuf[ph][j];
+      sumV2 += (double)v * (double)v;
+      sumI2 += (double)i * (double)i;
+      sumVI += (double)v * (double)i;
+      count++;
+    }
+
+    if (count < 10) count = NUM_SAMPLES; // fallback avoid div0
+    Vrms[ph] = sqrt(sumV2 / count);
+    Irms[ph] = sqrt(sumI2 / count);
+
+    // NEW: Apply 10V and 65mA noise thresholds
+    if (!isfinite(Vrms[ph]) || Vrms[ph] < VOLTAGE_NOISE_THRESHOLD) {
+      Vrms[ph] = 0.0f;
+    }
+    if (!isfinite(Irms[ph]) || Irms[ph] < CURRENT_NOISE_THRESHOLD) {
+      Irms[ph] = 0.0f; 
+      P[ph] = 0.0f; 
+      S[ph] = 0.0f; 
+      PF[ph] = 0.0f;
+    } else {
+      P[ph]  = sumVI / count;
+      S[ph]  = Vrms[ph] * Irms[ph];
+      PF[ph] = (S[ph] > 0.01f) ? (P[ph] / S[ph]) : 0.0f;
     }
   }
 
-  // If global protection is currently active AND the `COOLDOWN_TIME` has elapsed since activation:
-  if (globalProtectionActive && (millis() - globalProtectionStart >= COOLDOWN_TIME)) {
-    globalProtectionActive = false; // Reset the flag, allowing global protection to be disengaged.
-    // Deactivate all global relays (set to HIGH) to reconnect the main load.
-    // (Assuming HIGH signal deactivates the relay and closes the circuit).
-    for (int r = 0; r < 3; r++) digitalWrite(GLOBAL_RELAY_PINS[r], HIGH);
-    Serial.println("Global protection reset - Main load reconnected."); // Inform the Serial Monitor that protection has reset.
-  }
-}
-
-/**
- * @brief Handles individual phase protection logic, also used for dynamic load management (Transformer 2 switching).
- * This function checks if any phase current exceeds `INDIVIDUAL_LIMIT`. If it does, it activates
- * the `PHASE_RELAY_PINS` (e.g., to engage Transformer 2 or manage individual phase loads).
- * If all phase currents fall below `INDIVIDUAL_LIMIT`, these relays are deactivated.
- *
- * @param currents Array of RMS current values (in mA) for each phase.
- *
- * @note This implementation creates a simple ON/OFF behavior for the PHASE_RELAY_PINS based on
- * the `INDIVIDUAL_LIMIT`. For advanced "Dynamic Load Management" as described in the methodology,
- * which often involves hysteresis (different ON/OFF thresholds) and a sustained delay for
- * deactivation, further logic would be required here. Currently, T2 will engage if any phase
- * hits 1000mA, and disengage immediately when all phases drop below 1000mA.
- */
-void handleIndividualProtection(float currents[3]) {
-  bool overCurrent = false; // Flag to track if any phase is individually overcurrent.
-  // Check if any phase current exceeds the `INDIVIDUAL_LIMIT`.
+  // Pack into currentData
   for (int i = 0; i < 3; i++) {
-    if (currents[i] > INDIVIDUAL_LIMIT) {
-      overCurrent = true; // Set flag if an individual overcurrent condition is found.
-      break; // Exit the loop as soon as one overcurrent phase is detected.
+    currentData.voltages[i]   = Vrms[i];
+    currentData.currents[i]   = Irms[i];
+    currentData.currents_mA[i]= Irms[i] * 1000.0f;
+    currentData.VA[i]         = S[i];
+    currentData.power[i]      = P[i];
+    currentData.pf[i]         = PF[i];
+  }
+  currentData.totalPower = currentData.power[0] + currentData.power[1] + currentData.power[2];
+  currentData.totalVA    = currentData.VA[0]    + currentData.VA[1]    + currentData.VA[2];
+  currentData.totalPF    = (currentData.totalVA > 0.01f) ? (currentData.totalPower / currentData.totalVA) : 0.0f;
+
+  // Temperature smoothing
+  tempSensor.requestTemperatures();
+  float rawT = tempSensor.getTempCByIndex(0);
+  if (rawT > -50.0f && rawT < 150.0f && isfinite(rawT)) {
+    if (!isfinite(smoothedTemp)) {
+      smoothedTemp = rawT;
+      for (int i = 0; i < TEMP_SMOOTHING_READINGS; i++) tempReadings[i] = rawT;
+    } else {
+      smoothedTemp -= tempReadings[tempIndex] / TEMP_SMOOTHING_READINGS;
+      tempReadings[tempIndex] = rawT;
+      smoothedTemp += tempReadings[tempIndex] / TEMP_SMOOTHING_READINGS;
+      tempIndex = (tempIndex + 1) % TEMP_SMOOTHING_READINGS;
     }
+    currentData.temperature = smoothedTemp;
   }
-  
-  // Control individual phase relays (e.g., for Transformer 2 switching):
-  // If `overCurrent` is true (meaning at least one phase is over `INDIVIDUAL_LIMIT`),
-  // set relays to LOW (e.g., engage T2 or open individual phase control circuit).
-  // Otherwise (if `overCurrent` is false, meaning all currents are below `INDIVIDUAL_LIMIT`),
-  // set relays to HIGH (e.g., disengage T2 or close individual phase control circuit).
-  for (int i = 0; i < 3; i++) {
-    digitalWrite(PHASE_RELAY_PINS[i], overCurrent ? LOW : HIGH); // LOW for active/engage, HIGH for inactive/disengage
-  }
+
+  // Pot smoothing (%)
+  potValues[potIndex] = analogRead(potPin);
+  potIndex = (potIndex + 1) % POT_SMOOTHING;
+  int ps = 0; for (int i = 0; i < POT_SMOOTHING; i++) ps += potValues[i];
+  float avg = (float)ps / POT_SMOOTHING;
+  currentData.potentiometer = constrain((avg / 4095.0f) * 100.0f, 0.0f, 100.0f);
 }
 
-
-/**
- * @brief Performs a basic calibration for the current sensors (ACS712).
- * This function reads analog values from the current sensor pins when no load is
- * connected to determine the zero-current offset (bias) for each sensor.
- * It is absolutely crucial to run this routine with no loads connected to the transformer
- * to ensure accurate zero-point detection.
- */
-void calibrateSensors() {
-  Serial.println("Calibrating Current Sensors... (Please ensure no loads are connected to the transformer.)");
-  delay(2000); // Pause for 2 seconds, giving the user time to disconnect any active loads.
-
-  // Iterate through each current sensor to perform calibration.
-  for (int i = 0; i < 3; i++) {
-    long sum = 0; // Variable to accumulate raw ADC readings.
-    // Read 500 samples from the current sensor pin. Averaging multiple readings helps
-    // to reduce noise and get a more stable zero-point.
-    for (int j = 0; j < 500; j++) {
-      sum += analogRead(PHASE_CURR_PINS[i]); // Read the analog value.
-      delay(2); // Small delay between readings to ensure distinct samples.
-    }
-    zeroPoints[i] = sum / 500; // Calculate the average and store it as the zero-point offset for this specific sensor.
-    Serial.printf("Phase %d Current Sensor Zero Point: %d\n", i + 1, zeroPoints[i]); // Print the calibrated zero-point.
-  }
-  Serial.println("Calibration Complete."); // Indicate that the calibration process has finished.
+// ------------------------ Serial Dump ------------------------------
+void printSerialData() {
+  Serial.printf("V:%.1f,%.1f,%.1f\t", currentData.voltages[0], currentData.voltages[1], currentData.voltages[2]);
+  Serial.printf("I:%.3f,%.3f,%.3f A\t", currentData.currents[0], currentData.currents[1], currentData.currents[2]);
+  Serial.printf("W:%.2f,%.2f,%.2f|%.2f\t",
+                currentData.power[0], currentData.power[1], currentData.power[2], currentData.totalPower);
+  Serial.printf("VA:%.2f,%.2f,%.2f|%.2f\t",
+                currentData.VA[0], currentData.VA[1], currentData.VA[2], currentData.totalVA);
+  Serial.printf("PF:%.2f,%.2f,%.2f|%.2f\t",
+                currentData.pf[0], currentData.pf[1], currentData.pf[2], currentData.totalPF);
+  Serial.printf("T:%.1fC\tPot:%.1f%%\t", currentData.temperature, currentData.potentiometer);
+  Serial.printf("Load:%s\tFault:%s\tCharging:%s\tPump:%s\tT1:%s\tT2:%s",
+                loadStatus.c_str(), faultStatus.c_str(), charging_status.c_str(),
+                pump_state.c_str(), T1_status.c_str(), T2_status.c_str());
+  Serial.println();
 }
 
-// ===================== Setup Function =====================
-/**
- * @brief Arduino setup function. This function runs only once when the ESP32 starts up.
- * It is responsible for initializing serial communication, starting sensor libraries,
- * configuring pin modes for output controls (relays), and performing initial sensor calibration.
- */
+// ------------------------ Setup / Loop -----------------------------
 void setup() {
-  Serial.begin(115200);      // Initialize serial communication at a baud rate of 115200 for debugging output to the Serial Monitor.
-  analogReadResolution(12);  // Set the Analog-to-Digital Converter (ADC) resolution to 12 bits (0-4095) for more precise sensor readings on the ESP32.
-
-  // Initialize Blynk connection:
-  Serial.println("Connecting to Blynk...");
-  // `Blynk.begin()` attempts to connect to the Blynk server using the provided authentication token, WiFi SSID, and password.
-  Blynk.begin(auth, ssid, pass);
-
-  // Initialize DS18B20 temperature sensor:
-  sensors.begin(); // Start the DallasTemperature sensor library to detect and initialize the DS18B20 sensor.
-  // Configure the `TEMP_RELAY_PIN` as an output pin. This pin controls the cooling system relay.
-  pinMode(TEMP_RELAY_PIN, OUTPUT);
-  // Initialize `TEMP_RELAY_PIN` to HIGH. Assuming HIGH means the cooling system is OFF (relay inactive)
-  // This ensures a safe default state where cooling is not running initially.
-  digitalWrite(TEMP_RELAY_PIN, HIGH); 
-
-  // Initialize Voltage Sensor sensitivity and all Relay pins:
-  // This loop iterates for each of the three phases.
-  for (int i = 0; i < 3; i++) {
-    // Apply the defined `SENSITIVITY` to each `ZMPT101B` voltage sensor for accurate readings.
-    voltSensors[i].setSensitivity(SENSITIVITY);
-    
-    // Configure individual `PHASE_RELAY_PINS` as output pins. These control Transformer 2 switching or individual phase loads.
-    pinMode(PHASE_RELAY_PINS[i], OUTPUT);
-    // Initialize `PHASE_RELAY_PINS` to HIGH. Assuming HIGH means the phase relay is OFF (inactive/T2 disconnected)
-    // for a safe initial state.
-    digitalWrite(PHASE_RELAY_PAYS[i], HIGH); 
-    
-    // Configure global `GLOBAL_RELAY_PINS` as output pins. These control the main load disconnection for protection.
-    pinMode(GLOBAL_RELAY_PINS[i], OUTPUT);
-    // Initialize `GLOBAL_RELAY_PINS` to HIGH. Assuming HIGH means the global relay is OFF (inactive/main load connected)
-    // for a safe initial state.
-    digitalWrite(GLOBAL_RELAY_PINS[i], HIGH); 
-  }
-
-  // Run the sensor calibration routine. It is critically important that no active loads
-  // are connected to the transformer during this calibration process to ensure accuracy.
-  calibrateSensors();
-  Serial.println("System Ready - Entering Loop."); // Print a message to the Serial Monitor indicating that setup is complete and the main loop will begin execution.
+  Serial.begin(115200);
+  delay(500);
+  Serial.println("== Smart Transformer PF-enabled Init ==");
+  InitWiFi();
+  setupSensors();
+  setupRelays();
+  Serial.println("Init complete.");
+  Serial.println("V(V)\tI(A)\tW|Wtot\tVA|VAtot\tPF|PFtot\tT\tPot\tLoad/Fault\tChg/Pump\tT1/T2");
 }
 
-// ===================== Loop Function =====================
-/**
- * @brief Arduino loop function. This function runs continuously after the `setup()` function completes.
- * It acts as the main execution cycle of the program, continuously handling Blynk communication,
- * reading sensor data, applying control logic for protection and cooling, and transmitting data.
- */
 void loop() {
-  Blynk.run(); // This essential function maintains the connection to the Blynk server and processes
-               // any incoming commands from the Blynk app or data sent from the ESP32 to Blynk.
-               // It should be called as frequently as possible to ensure responsiveness.
+  if (WiFi.status() != WL_CONNECTED) InitWiFi();
 
-  // Static variable to track the last time sensor data was read.
-  // Using `static` ensures its value persists across loop calls.
-  // This implements a non-blocking delay mechanism, allowing other tasks to run.
-  static unsigned long lastRead = 0;
-  
-  // Check if `200 milliseconds` have passed since the last sensor reading.
-  // This defines the update rate for sensor data acquisition and control logic execution.
-  if (millis() - lastRead >= 200) {
-    lastRead = millis(); // Update the timestamp of the last sensor read to the current `millis()` value.
-
-    float currents[3], voltages[3]; // Declare arrays to store the measured current and voltage values for each phase.
-    readSensors(currents, voltages); // Call the `readSensors` function to populate `currents` and `voltages` arrays with fresh data.
-
-    // Update temperature reading and apply smoothing:
-    sensors.requestTemperatures();         // Command the `DS18B20` sensor to perform a temperature conversion.
-    float rawTemp = sensors.getTempCByIndex(0); // Retrieve the temperature in Celsius from the first connected `DS18B20` sensor.
-    
-    // Simple moving average calculation for temperature smoothing:
-    // This helps to filter out noise and provide a more stable temperature reading.
-    // 1. Subtract the contribution of the oldest reading in the `tempReadings` buffer from the `smoothedTemp` total.
-    smoothedTemp -= tempReadings[currentIndex] / SMOOTHING_READINGS;
-    // 2. Store the new `rawTemp` reading in the circular buffer at the `currentIndex`.
-    tempReadings[currentIndex] = rawTemp;
-    // 3. Add the contribution of the new reading to the `smoothedTemp` total.
-    smoothedTemp += tempReadings[currentIndex] / SMOOTHING_READINGS;
-    // 4. Move to the next index in the circular buffer for the next reading, wrapping around if the end is reached.
-    currentIndex = (currentIndex + 1) % SMOOTHING_READINGS;
-
-    // Control cooling system based on smoothed temperature:
-    // If the `smoothedTemp` exceeds the defined `TEMP_LIMIT`, activate the cooling relay by setting `TEMP_RELAY_PIN` to LOW.
-    // Otherwise (if temperature is at or below the limit), deactivate the cooling relay by setting `TEMP_RELAY_PIN` to HIGH.
-    digitalWrite(TEMP_RELAY_PIN, smoothedTemp > TEMP_LIMIT ? LOW : HIGH); // LOW for ON, HIGH for OFF
-
-    // Handle overcurrent protections:
-    handleGlobalProtection(currents);     // Execute the global overcurrent protection logic.
-    handleIndividualProtection(currents); // Execute the individual phase protection/dynamic load management logic.
-
-    // Send sensor data to Blynk virtual pins for remote monitoring and visualization on the Blynk dashboard.
-    Blynk.virtualWrite(BLYNK_V_TEMP, smoothedTemp); // Send smoothed temperature to Virtual Pin V0.
-    for (int i = 0; i < 3; i++) {
-      Blynk.virtualWrite(BLYNK_V_VOLT1 + i, voltages[i]); // Send voltages to Virtual Pins V1, V2, V3.
-      Blynk.virtualWrite(BLYNK_V_CURR1 + i, currents[i]); // Send currents to Virtual Pins V4, V5, V6.
-    }
-
-    // Print current sensor data to the Serial Monitor for local debugging and real-time feedback.
-    // This formatted string includes temperature, all three voltages, and all three currents.
-    Serial.printf("Temp: %.1fC | V: %.1f/%.1f/%.1fV | I: %.0f/%.0f/%.0fmA\n",
-                  smoothedTemp, voltages[0], voltages[1], voltages[2],
-                  currents[0], currents[1], currents[2]);
+  bool tbConnected = tb.connected();
+  if (!tbConnected) {
+    Serial.println("Connecting to ThingsBoard...");
+    tbConnected = tb.connect(THINGSBOARD_SERVER, TOKEN, THINGSBOARD_PORT);
+    Serial.println(tbConnected ? "Connected to ThingsBoard" : "Failed to connect to ThingsBoard");
   }
+
+  // Read waveforms + PF roughly every SENSOR_READ_INTERVAL
+  if (millis() - lastSensorRead >= SENSOR_READ_INTERVAL) {
+    lastSensorRead = millis();
+    readWaveformPF();                            // <-- true PF here
+    controlRelays(tbConnected);                  // relays only active if TB connected
+    printSerialData();
+  }
+
+  // Telemetry every TELEMETRY_SEND_INTERVAL
+  if (tbConnected && (millis() - previousDataSend >= TELEMETRY_SEND_INTERVAL)) {
+    previousDataSend = millis();
+
+    // Per-phase volt, curr, W, VA, PF
+    tb.sendTelemetryData("voltage1", currentData.voltages[0]);
+    tb.sendTelemetryData("voltage2", currentData.voltages[1]);
+    tb.sendTelemetryData("voltage3", currentData.voltages[2]);
+
+    tb.sendTelemetryData("current1_A", currentData.currents[0]);
+    tb.sendTelemetryData("current2_A", currentData.currents[1]);
+    tb.sendTelemetryData("current3_A", currentData.currents[2]);
+
+    tb.sendTelemetryData("power1_W", currentData.power[0]);
+    tb.sendTelemetryData("power2_W", currentData.power[1]);
+    tb.sendTelemetryData("power3_W", currentData.power[2]);
+    tb.sendTelemetryData("power_total_W", currentData.totalPower);
+
+    tb.sendTelemetryData("VA1", currentData.VA[0]);
+    tb.sendTelemetryData("VA2", currentData.VA[1]);
+    tb.sendTelemetryData("VA3", currentData.VA[2]);
+    tb.sendTelemetryData("VA_total", currentData.totalVA);
+
+    tb.sendTelemetryData("pf1", currentData.pf[0]);
+    tb.sendTelemetryData("pf2", currentData.pf[1]);
+    tb.sendTelemetryData("pf3", currentData.pf[2]);
+    tb.sendTelemetryData("pf_total", currentData.totalPF);
+
+    // Misc
+    tb.sendTelemetryData("temperature_C", currentData.temperature);
+    tb.sendTelemetryData("potentiometer_pct", currentData.potentiometer);
+
+    // Statuses
+    tb.sendTelemetryData("load_status", loadStatus.c_str());
+    tb.sendTelemetryData("fault_status", faultStatus.c_str());
+    tb.sendTelemetryData("charging_status", charging_status.c_str());
+    tb.sendTelemetryData("pump_state", pump_state.c_str());
+    tb.sendTelemetryData("T1_status", T1_status.c_str());
+    tb.sendTelemetryData("T2_status", T2_status.c_str());
+
+    Serial.println("Telemetry sent.");
+  }
+
+  tb.loop();
+  delay(5);
 }
