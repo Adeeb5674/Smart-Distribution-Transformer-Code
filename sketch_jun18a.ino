@@ -5,6 +5,11 @@
   - Auto phase alignment via cross-correlation (per phase)
   - ThingsBoard telemetry integrated
   - Relays kept OFF until TB is connected (safety)
+
+  Protection Logic (Option A):
+  - Load activation: any phase Irms ≥ 1.25 A -> Relays 1–3 ON
+  - Overload: any phase Irms ≥ 2.50 A -> Relays 4–6 OFF for 60 s
+  - Undervoltage: any phase Vrms < 20.0 V -> Relays 4–6 OFF for 60 s
 */
 
 #include <Adafruit_ADS1X15.h>
@@ -29,36 +34,35 @@ WiFiClient wifiClient;
 Arduino_MQTT_Client mqttClient(wifiClient);
 ThingsBoard tb(mqttClient);
 
-// ------------------------ Voltage Sensors (ZMPT on ADC) -----------
+// ------------------------ Voltage Sensors (ZMPT on ADC) ------------
 const uint8_t SENSOR_PIN0 = 32; // L1
 const uint8_t SENSOR_PIN1 = 33; // L2
 const uint8_t SENSOR_PIN2 = 34; // L3
 
-// Optional: keep ZMPT objects for your existing calibration flow (not used for PF)
 #define VOLT_SENSITIVITY 440.75f
 #define NOISE_THRESHOLD 5.0f
 ZMPT101B voltageSensor0(SENSOR_PIN0);
 ZMPT101B voltageSensor1(SENSOR_PIN1);
 ZMPT101B voltageSensor2(SENSOR_PIN2);
 
-// ADC scaling for ESP32 raw -> volts, then to actual secondary volts (per-phase scale)
+// ESP32 ADC raw -> volts, then scaled to actual secondary Vrms
 constexpr float ADC_TO_VOLTS = 3.3f / 4095.0f;
-// Set these after first test so Vrms ≈ your real secondary (e.g., 24–26V)
-float VOLT_SCALE1 = 480.0f; // for L1 (update after first run)
-float VOLT_SCALE2 = 480.0f; // for L2
-float VOLT_SCALE3 = 480.0f; // for L3
+// Adjust after first calibration run so Vrms ≈ 24–26 V at no/nominal load
+float VOLT_SCALE1 = 480.0f; // L1
+float VOLT_SCALE2 = 480.0f; // L2
+float VOLT_SCALE3 = 480.0f; // L3
 
-// ------------------------ Current Sensors (ADS1115 + ACS712) ------
+// ------------------------ Current Sensors (ADS1115 + ACS712) -------
 Adafruit_ADS1115 ads;
 const int NUM_CHANNELS = 3;
 const int CURR_CH[NUM_CHANNELS] = {0, 1, 2}; // ADS A0,A1,A2
 
-// Sensitivity V/A for ACS712: 5A=0.185, 20A=0.100, 30A=0.066
+// ACS712 sensitivity (Volts per Amp). Your tuned value ~0.07187 V/A
 const float CURRENT_SENSITIVITY[NUM_CHANNELS] = {0.07187f, 0.07187f, 0.07187f};
 
 // Offsets captured at startup (raw units)
-float voltOffsetADC[NUM_CHANNELS] = {0, 0, 0};   // ESP32 ADC raw (0..4095)
-int16_t currOffsetRAW[NUM_CHANNELS] = {0, 0, 0}; // ADS1115 raw
+float   voltOffsetADC[NUM_CHANNELS] = {0, 0, 0}; // ESP32 ADC baseline
+int16_t currOffsetRAW[NUM_CHANNELS] = {0, 0, 0}; // ADS1115 baseline
 
 // ------------------------ Temperature & Pot ------------------------
 const int ONE_WIRE_BUS = 4;
@@ -67,36 +71,41 @@ DallasTemperature tempSensor(&oneWire);
 
 const int TEMP_SMOOTHING_READINGS = 10;
 float tempReadings[TEMP_SMOOTHING_READINGS] = {};
-int tempIndex = 0;
+int   tempIndex = 0;
 float smoothedTemp = NAN;
 
 const int potPin = 36; // ADC
 const int POT_SMOOTHING = 10;
-int potValues[POT_SMOOTHING] = {};
-int potIndex = 0;
+int   potValues[POT_SMOOTHING] = {};
+int   potIndex = 0;
 float smoothedPotPercent = 0.0f;
 
 // ------------------------ Relays -----------------------------------
 const int relayPins[8] = {13, 14, 16, 17, 25, 26, 27, 19};
-unsigned long relayOffTime[8] = {0};
+unsigned long relayOffTime[8] = {0}; // use [3] as the 60 s timer for relays 4–6
 
 // ------------------------ States/Status Strings --------------------
-bool lastRelay456State = true;
-String loadStatus = "Connected";
-String faultStatus = "No";
-String T1_status = "OFF";
-String T2_status = "OFF";
+bool   lastRelay456State = true;
+String loadStatus  = "Connected";
+String faultStatus = "No";      // "No", "Undervoltage", "Overload"
+String T1_status   = "OFF";
+String T2_status   = "OFF";
 String charging_status = "OFF";
-String pump_state = "OFF";
+String pump_state      = "OFF";
 
 // ------------------------ PF Sampling / Math -----------------------
-const int NUM_SAMPLES = 200;        // waveform samples per cycle
-const int SAMPLE_DELAY_US = 250;    // ~4 kHz overall sampling cadence
-const int MAX_LAG = 12;             // cross-correlation search window (±lag samples)
+const int NUM_SAMPLES = 200;      // waveform samples per cycle
+const int SAMPLE_DELAY_US = 250;  // ~4 kHz sampling cadence
+const int MAX_LAG = 12;           // cross-correlation search window (±lag samples)
 
-// ------------------------ NEW: Noise Thresholds --------------------
-const float VOLTAGE_NOISE_THRESHOLD = 10.0f;    // 10V threshold
-const float CURRENT_NOISE_THRESHOLD = 0.065f;   // 65mA threshold
+// ------------------------ Noise Thresholds -------------------------
+const float VOLTAGE_NOISE_THRESHOLD = 10.0f;  // Vrms below this treated as 0
+const float CURRENT_NOISE_THRESHOLD = 0.065f; // Irms below this treated as 0 A
+
+// ------------------------ NEW Protection Thresholds ----------------
+const float LOAD_THRESHOLD      = 1.25f;  // any phase ≥ -> Relays 1–3 ON
+const float OVERLOAD_THRESHOLD  = 2.50f;  // any phase ≥ -> Relays 4–6 OFF 60 s
+const float UNDERVOLT_THRESHOLD = 20.0f;  // any phase < -> Relays 4–6 OFF 60 s
 
 // ------------------------ Timing -----------------------------------
 uint32_t previousDataSend = 0;
@@ -143,12 +152,18 @@ float readVoltageRMS_ZMPT(ZMPT101B& sensor) {
   return (v < NOISE_THRESHOLD) ? 0.0f : v;
 }
 
+// Update connection and a generic fault indicator,
+// but do NOT overwrite a specific fault reason if one is active.
 void monitorLoadStatus() {
   bool r456 = (digitalRead(relayPins[3]) == HIGH &&
                digitalRead(relayPins[4]) == HIGH &&
                digitalRead(relayPins[5]) == HIGH);
   loadStatus  = r456 ? "Connected" : "Disconnected";
-  faultStatus = r456 ? "No" : "Yes";
+
+  // If no specific fault reason was set, show simple Yes/No
+  if (faultStatus == "No") {
+    faultStatus = r456 ? "No" : "Yes";
+  }
   lastRelay456State = r456;
 }
 
@@ -229,17 +244,18 @@ void setupRelays() {
 void calculateT1T2Status() {
   float max_mA = max(currentData.currents_mA[0],
                  max(currentData.currents_mA[1], currentData.currents_mA[2]));
-  T1_status = (max_mA >= 90.0f && max_mA <= 2000.0f) ? "ON" : "OFF";
+  T1_status = (max_mA >= 90.0f  && max_mA <= 2000.0f) ? "ON" : "OFF";
   T2_status = (max_mA >= 1000.0f && max_mA <= 2000.0f) ? "ON" : "OFF";
 }
 
-// ------------------------ Relay Control ----------------------------
+// ------------------------ Relay Control (UPDATED) -------------------
 void controlRelays(bool systemEnabled) {
   // If not enabled (TB not connected), keep everything OFF for safety
   if (!systemEnabled) {
     for (int i = 0; i < 8; i++) digitalWrite(relayPins[i], LOW);
     charging_status = "OFF";
     pump_state = "OFF";
+    faultStatus = "No";
     calculateT1T2Status();
     monitorLoadStatus();
     return;
@@ -247,24 +263,40 @@ void controlRelays(bool systemEnabled) {
 
   unsigned long now = millis();
 
-  // Relays 1-3: ON if any phase >= 1.0 A
-  bool highCurrent = (currentData.currents[0] >= 1.0f ||
-                      currentData.currents[1] >= 1.0f ||
-                      currentData.currents[2] >= 1.0f);
-  for (int i = 0; i < 3; i++) digitalWrite(relayPins[i], highCurrent ? LOW : HIGH);
+  // ---- New protection conditions ----
+  bool underVoltage = (
+    currentData.voltages[0] < UNDERVOLT_THRESHOLD ||
+    currentData.voltages[1] < UNDERVOLT_THRESHOLD ||
+    currentData.voltages[2] < UNDERVOLT_THRESHOLD
+  );
 
-  // Relays 4-6: Overcurrent >= 2.0 A -> OFF for 60s
-  bool veryHigh = (currentData.currents[0] >= 2.0f ||
-                   currentData.currents[1] >= 2.0f ||
-                   currentData.currents[2] >= 2.0f);
-  if (veryHigh) {
-    relayOffTime[3] = now;
+  bool veryHigh = (
+    currentData.currents[0] >= OVERLOAD_THRESHOLD ||
+    currentData.currents[1] >= OVERLOAD_THRESHOLD ||
+    currentData.currents[2] >= OVERLOAD_THRESHOLD
+  );
+
+  // If undervoltage OR overload -> Relays 4–6 OFF for 60 s
+  if (underVoltage || veryHigh) {
+    relayOffTime[3] = now;                          // use index 3 timer for group 4–6
     for (int i = 3; i < 6; i++) digitalWrite(relayPins[i], LOW);
+    faultStatus = underVoltage ? "Undervoltage" : "Overload";
   } else if (now - relayOffTime[3] >= 60000UL) {
+    // If protection window elapsed and no current fault, restore relays 4–6
     for (int i = 3; i < 6; i++) digitalWrite(relayPins[i], HIGH);
+    // Only clear specific fault if relays are restored and no new fault
+    faultStatus = "No";
   }
 
-  // Relay 7: charging window 20–28 V (avg)
+  // Relays 1–3: ON if any phase >= 1.25 A (load detection)
+  bool highCurrent = (
+    currentData.currents[0] >= LOAD_THRESHOLD ||
+    currentData.currents[1] >= LOAD_THRESHOLD ||
+    currentData.currents[2] >= LOAD_THRESHOLD
+  );
+  for (int i = 0; i < 3; i++) digitalWrite(relayPins[i], highCurrent ? LOW : HIGH);
+
+  // Relay 7: charging window 20–28 V (avg of three phases)
   float vAvg = (currentData.voltages[0] + currentData.voltages[1] + currentData.voltages[2]) / 3.0f;
   bool chargeOn = (vAvg >= 20.0f && vAvg <= 28.0f);
   digitalWrite(relayPins[6], chargeOn ? HIGH : LOW);
@@ -276,7 +308,7 @@ void controlRelays(bool systemEnabled) {
   pump_state = pumpOn ? "ON" : "OFF";
 
   calculateT1T2Status();
-  monitorLoadStatus();
+  monitorLoadStatus(); // preserves specific reason in faultStatus if present
 }
 
 // ------------------------ Waveform Read + PF Math ------------------
@@ -339,7 +371,7 @@ void readWaveformPF() {
     Vrms[ph] = sqrt(sumV2 / count);
     Irms[ph] = sqrt(sumI2 / count);
 
-    // NEW: Apply 10V and 65mA noise thresholds
+    // Apply noise thresholds
     if (!isfinite(Vrms[ph]) || Vrms[ph] < VOLTAGE_NOISE_THRESHOLD) {
       Vrms[ph] = 0.0f;
     }
@@ -357,12 +389,12 @@ void readWaveformPF() {
 
   // Pack into currentData
   for (int i = 0; i < 3; i++) {
-    currentData.voltages[i]   = Vrms[i];
-    currentData.currents[i]   = Irms[i];
-    currentData.currents_mA[i]= Irms[i] * 1000.0f;
-    currentData.VA[i]         = S[i];
-    currentData.power[i]      = P[i];
-    currentData.pf[i]         = PF[i];
+    currentData.voltages[i]    = Vrms[i];
+    currentData.currents[i]    = Irms[i];
+    currentData.currents_mA[i] = Irms[i] * 1000.0f;
+    currentData.VA[i]          = S[i];
+    currentData.power[i]       = P[i];
+    currentData.pf[i]          = PF[i];
   }
   currentData.totalPower = currentData.power[0] + currentData.power[1] + currentData.power[2];
   currentData.totalVA    = currentData.VA[0]    + currentData.VA[1]    + currentData.VA[2];
@@ -434,7 +466,7 @@ void loop() {
   // Read waveforms + PF roughly every SENSOR_READ_INTERVAL
   if (millis() - lastSensorRead >= SENSOR_READ_INTERVAL) {
     lastSensorRead = millis();
-    readWaveformPF();                            // <-- true PF here
+    readWaveformPF();                            // true PF
     controlRelays(tbConnected);                  // relays only active if TB connected
     printSerialData();
   }
@@ -473,7 +505,7 @@ void loop() {
 
     // Statuses
     tb.sendTelemetryData("load_status", loadStatus.c_str());
-    tb.sendTelemetryData("fault_status", faultStatus.c_str());
+    tb.sendTelemetryData("fault_status", faultStatus.c_str());   // now shows reason
     tb.sendTelemetryData("charging_status", charging_status.c_str());
     tb.sendTelemetryData("pump_state", pump_state.c_str());
     tb.sendTelemetryData("T1_status", T1_status.c_str());
